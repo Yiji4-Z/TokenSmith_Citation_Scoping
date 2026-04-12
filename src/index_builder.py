@@ -18,6 +18,7 @@ from src.embedder import SentenceTransformer
 
 from src.preprocessing.chunking import DocumentChunker, ChunkConfig, print_chunk_stats
 from src.preprocessing.extraction import extract_sections_from_markdown
+from src.metadata_store import MetadataStore
 
 # ----- runtime parallelism knobs (avoid oversubscription) -----
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -208,6 +209,13 @@ def build_index(
     with open(output_file, "w") as f:
         json.dump(index_info, f, indent=2)
     print(f"Saved index information: {output_file}")
+
+    # Populate SQLite metadata store for scoped retrieval
+    print("Populating SQLite metadata store...")
+    store = MetadataStore(db_path=str(pathlib.Path("index") / "metadata.db"))
+    inserted = store.populate_from_metadata(metadata)
+    store.close()
+    print(f"SQLite metadata store updated ({inserted} new rows).")
 
 # ------------------------ Helper functions ------------------------------
 

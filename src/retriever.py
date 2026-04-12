@@ -77,6 +77,62 @@ def filter_retrieved_chunks(cfg: RAGConfig, chunks, ordered):
     topk_idxs = ordered[:cfg.top_k]
     return topk_idxs
 
+
+# -------------------------- Scoped retrieval helpers --------------------
+
+def apply_pre_filter(
+    raw_scores: Dict[str, Dict[int, float]],
+    valid_ids: Optional[set],
+) -> Dict[str, Dict[int, float]]:
+    """
+    Pre-filter strategy: remove candidates outside *valid_ids* from every
+    retriever's score dict *before* they reach the ranker.
+
+    When *valid_ids* is None (no scope active), raw_scores is returned as-is.
+    """
+    if valid_ids is None:
+        return raw_scores
+    return {
+        name: {k: v for k, v in scores.items() if k in valid_ids}
+        for name, scores in raw_scores.items()
+    }
+
+
+def apply_post_filter(ordered: List[int], valid_ids: Optional[set]) -> List[int]:
+    """
+    Post-filter strategy: remove chunk indices outside *valid_ids* from the
+    ranked list *after* the ranker has ordered them.
+
+    When *valid_ids* is None (no scope active), ordered is returned as-is.
+    """
+    if valid_ids is None:
+        return ordered
+    return [i for i in ordered if i in valid_ids]
+
+
+def format_citations(topk_idxs: List[int], meta: List[dict]) -> str:
+    """
+    Build a human-readable citation block for the top retrieved chunks.
+
+    Each line shows: rank | section path | pages.
+    Returns an empty string when metadata is unavailable.
+    """
+    if not meta or not topk_idxs:
+        return ""
+    lines = []
+    for rank, idx in enumerate(topk_idxs, 1):
+        if 0 <= idx < len(meta):
+            m = meta[idx]
+            section = m.get("section_path", m.get("section", "Unknown"))
+            pages = m.get("page_numbers", [])
+            page_str = (
+                f"p. {pages[0]}" if len(pages) == 1
+                else f"pp. {pages[0]}–{pages[-1]}" if pages
+                else "page unknown"
+            )
+            lines.append(f"  [{rank}] {section}  ({page_str})")
+    return "\n".join(lines)
+
 # -------------------------- Retrieval core ------------------------------
 
 class Retriever(ABC):

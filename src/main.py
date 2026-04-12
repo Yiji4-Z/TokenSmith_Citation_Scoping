@@ -20,15 +20,20 @@ from src.ranking.ranker import EnsembleRanker
 from src.preprocessing.chunking import DocumentChunker
 from src.query_enhancement import generate_hypothetical_document, contextualize_query
 from src.retriever import (
-    filter_retrieved_chunks, 
-    BM25Retriever, 
-    FAISSRetriever, 
-    IndexKeywordRetriever, 
-    get_page_numbers, 
-    load_artifacts
+    filter_retrieved_chunks,
+    apply_pre_filter,
+    apply_post_filter,
+    format_citations,
+    BM25Retriever,
+    FAISSRetriever,
+    IndexKeywordRetriever,
+    get_page_numbers,
+    load_artifacts,
 )
 from src.ranking.reranker import rerank
 from src.cache import get_cache
+from src.metadata_store import MetadataStore, ProvenanceStore
+from src.utils import parse_chapter_arg
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
 
@@ -42,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model_path", help="path to generation model")
     parser.add_argument("--system_prompt_mode", choices=["baseline", "tutor", "concise", "detailed"], default="baseline")
-    
+
     indexing_group = parser.add_argument_group("indexing options")
     indexing_group.add_argument("--keep_tables", action="store_true")
     indexing_group.add_argument("--multiproc_indexing", action="store_true")
@@ -56,10 +61,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--double_prompt",
         action="store_true",
-        help="enable double prompting for higher quality answers"
+        help="enable double prompting for higher quality answers",
+    )
+
+    # ---- scoped retrieval ----
+    scope_group = parser.add_argument_group("scoped retrieval")
+    scope_group.add_argument(
+        "--scope_source",
+        default=None,
+        metavar="FILENAME",
+        help="restrict retrieval to chunks whose source filename contains this substring",
+    )
+    scope_group.add_argument(
+        "--scope_chapter",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="N",
+        help=(
+            "restrict retrieval to one or more chapters. "
+            "Examples: --scope_chapter 18  "
+            "--scope_chapter 1 2 3  "
+            "--scope_chapter 1-5"
+        ),
+    )
+    scope_group.add_argument(
+        "--scope_pages",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("FROM", "TO"),
+        help="restrict retrieval to chunks that touch any page in [FROM, TO]",
+    )
+    scope_group.add_argument(
+        "--scope_strategy",
+        choices=["pre", "post"],
+        default="post",
+        help="'pre'  – filter candidates before ranking; "
+             "'post' – filter after ranking (default: post)",
     )
 
     return parser.parse_args()
+
 
 def run_index_mode(args: argparse.Namespace, cfg: RAGConfig):
     strategy = cfg.get_chunk_strategy()
@@ -153,11 +196,18 @@ def get_answer(
     artifacts: Optional[Dict] = None,
     golden_chunks: Optional[list] = None,
     is_test_mode: bool = False,
-    additional_log_info: Optional[Dict[str, Any]] = None
+    additional_log_info: Optional[Dict[str, Any]] = None,
+    valid_ids: Optional[set] = None,
 ) -> Union[str, Tuple[str, List[Dict[str, Any]], Optional[str]]]:
     """
     Run a single query through the pipeline.
-    """    
+
+    Parameters
+    ----------
+    valid_ids : optional set of chunk IDs produced by MetadataStore.build_valid_ids().
+                When provided, scoped retrieval is applied according to
+                args.scope_strategy ('pre' or 'post').
+    """
     chunks = artifacts["chunks"]
     sources = artifacts["sources"]
     retrievers = artifacts["retrievers"]
@@ -168,18 +218,19 @@ def get_answer(
     topk_idxs: List[int] = []
     scores = []
 
+    # ---- resolve scope strategy ----
+    scope_strategy = getattr(args, "scope_strategy", "post")
+
     cache = get_cache(cfg)
     normalized_question = cache.normalize_question(question)
     config_cache_key = cache.make_config_key(cfg, args, golden_chunks)
     question_embedding = cache.compute_embedding(normalized_question, retrievers, cfg.embed_model)
-    
+
     semantic_hit = cache.lookup(config_cache_key, question_embedding, normalized_question)
 
     # Return cached answer if found
     if semantic_hit is not None:
-
         ans = semantic_hit.get("answer", "")
-
         if is_test_mode:
             return ans, semantic_hit.get("chunks_info"), semantic_hit.get("hyde_query")
         console.print("Using cached answer")
@@ -190,55 +241,53 @@ def get_answer(
     chunks_info = None
     hyde_query = None
     if golden_chunks and cfg.use_golden_chunks:
-        # Use provided golden chunks
         ranked_chunks = golden_chunks
     elif cfg.disable_chunks:
-        # No chunks - baseline mode
         ranked_chunks = []
     elif cfg.use_indexed_chunks:
         ranked_chunks, topk_idxs = use_indexed_chunks(question, chunks, cfg, args)
     else:
         retrieval_query = question
-        # print(f"Retrieval query: {retrieval_query}")
         if cfg.use_hyde:
             retrieval_query = generate_hypothetical_document(question, cfg.gen_model, max_tokens=cfg.hyde_max_tokens)
 
         pool_n = max(cfg.num_candidates, cfg.top_k + 10)
         raw_scores: Dict[str, Dict[int, float]] = {}
         for retriever in retrievers:
-            # print(f"Getting scores from retriever: {retriever.name}...")
             raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
-        # TODO: Fix retrieval logging.
 
-        # print("Raw scores from retrievers:")
-        # for retriever_name, score_dict in raw_scores.items():
-        #     print(f"  {retriever_name}: {list(score_dict.values())}")
+        # ---- Scoped retrieval: pre-filter strategy ----
+        # Remove out-of-scope candidates before the ranker sees them so that
+        # only in-scope chunks compete for the top-k slots.
+        if valid_ids is not None and scope_strategy == "pre":
+            raw_scores = apply_pre_filter(raw_scores, valid_ids)
+
         # Step 2: Ranking
         ordered, scores = ranker.rank(raw_scores=raw_scores)
-        # print(f"Ordered candidate indices after ranking: {ordered[:cfg.top_k]}")
-        # print(f"Corresponding scores: {scores[:cfg.top_k]}")
+
+        # ---- Scoped retrieval: post-filter strategy ----
+        # Re-order after ranking but before taking top-k; out-of-scope chunks
+        # are removed from the ranked list regardless of their score.
+        if valid_ids is not None and scope_strategy == "post":
+            ordered = apply_post_filter(ordered, valid_ids)
+
         topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)
         ranked_chunks = [chunks[i] for i in topk_idxs]
-        # print(f"Top-{cfg.top_k} chunk indices after filtering: {topk_idxs}")
-        # print("Len Ranked chunks:", len(ranked_chunks))
-        # print("Example ranked chunk content:", ranked_chunks[0] if ranked_chunks else "No chunks retrieved")
-        
-        
+
         # Capture chunk info if in test mode
         if is_test_mode:
-            # Compute individual ranker ranks
             faiss_scores = raw_scores.get("faiss", {})
             bm25_scores = raw_scores.get("bm25", {})
             index_scores = raw_scores.get("index_keywords", {})
-            
+
             faiss_ranked = sorted(faiss_scores.keys(), key=lambda i: faiss_scores[i], reverse=True)
             bm25_ranked = sorted(bm25_scores.keys(), key=lambda i: bm25_scores[i], reverse=True)
             index_ranked = sorted(index_scores.keys(), key=lambda i: index_scores[i], reverse=True)
-            
+
             faiss_ranks = {idx: rank + 1 for rank, idx in enumerate(faiss_ranked)}
             bm25_ranks = {idx: rank + 1 for rank, idx in enumerate(bm25_ranked)}
             index_ranks = {idx: rank + 1 for rank, idx in enumerate(index_ranked)}
-            
+
             chunks_info = []
             for rank, idx in enumerate(topk_idxs, 1):
                 chunks_info.append({
@@ -255,8 +304,6 @@ def get_answer(
 
         # Step 3: Final re-ranking
         ranked_chunks = rerank(question, ranked_chunks, mode=cfg.rerank_mode, top_n=cfg.rerank_top_k)
-        # print("Reranked Chunks", type(ranked_chunks), len(ranked_chunks), type(ranked_chunks[0]) if ranked_chunks else "No chunks")
-        # print("Example reranked chunk content:", ranked_chunks[0] if ranked_chunks else "No chunks after reranking")
 
     if not ranked_chunks and not cfg.disable_chunks:
         if console:
@@ -286,21 +333,31 @@ def get_answer(
         )
 
     if is_test_mode:
-        ans = dedupe_generated_text("".join(stream_iter))
+        ans = ""
+        for delta in stream_iter:
+            ans += delta
+        ans = dedupe_generated_text(ans)
+        return ans, chunks_info, hyde_query
     else:
-        # Accumulate the full text while rendering incremental Markdown chunks
         ans = render_streaming_ans(console, stream_iter)
 
-        # Logging
+        # ---- Source citations display ----
         meta = artifacts.get("meta", [])
+        if topk_idxs and meta and console:
+            citation_text = format_citations(topk_idxs, meta)
+            if citation_text:
+                console.print("\n[bold yellow]Sources:[/bold yellow]")
+                console.print(citation_text)
+
+        # Logging (JSON file)
         page_nums = get_page_numbers(topk_idxs, meta)
         logger.save_chat_log(
             query=question,
             config_state=cfg.get_config_state(),
-            ordered_scores=scores[:len(topk_idxs)] if 'scores' in locals() else [],
+            ordered_scores=scores[:len(topk_idxs)] if scores else [],
             chat_request_params={
                 "system_prompt": system_prompt,
-                "max_tokens": cfg.max_gen_tokens
+                "max_tokens": cfg.max_gen_tokens,
             },
             top_idxs=topk_idxs,
             chunks=[chunks[i] for i in topk_idxs],
@@ -308,7 +365,7 @@ def get_answer(
             page_map=page_nums,
             full_response=ans,
             top_k=len(topk_idxs),
-            additional_log_info=additional_log_info
+            additional_log_info=additional_log_info,
         )
 
     # Step 5: Store in semantic cache
@@ -384,7 +441,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
         retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
         if cfg.ranker_weights.get("index_keywords", 0) > 0:
             retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))
-        
+
         ranker = EnsembleRanker(ensemble_method=cfg.ensemble_method, weights=cfg.ranker_weights, rrf_k=int(cfg.rrf_k))
         print("Loaded retrievers and initialized ranker.")
         artifacts = {"chunks": chunks, "sources": sources, "retrievers": retrievers, "ranker": ranker, "meta": meta}
@@ -392,12 +449,55 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
         print(f"ERROR: {e}. Run 'index' mode first.")
         sys.exit(1)
 
+    # ---- Initialize metadata and provenance stores ----
+    meta_store = MetadataStore(db_path="index/metadata.db")
+    prov_store = ProvenanceStore(db_path="index/provenance.db")
+
+    # Populate SQLite from pkl on first run (idempotent – skips existing rows)
+    if meta_store.is_empty() and meta:
+        print("Populating SQLite metadata store from index artifacts...")
+        meta_store.populate_from_metadata(meta)
+        print(f"  Done ({len(meta)} chunks registered).")
+
+    # ---- Build valid_ids for scoped retrieval (once per session) ----
+    scope_source = getattr(args, "scope_source", None)
+    scope_chapter_raw = getattr(args, "scope_chapter", None)
+    scope_chapters = parse_chapter_arg(scope_chapter_raw) if scope_chapter_raw else None
+    scope_pages = getattr(args, "scope_pages", None)   # [from, to] or None
+    from_page = scope_pages[0] if scope_pages else None
+    to_page   = scope_pages[1] if scope_pages else None
+
+    valid_ids = meta_store.build_valid_ids(
+        source=scope_source,
+        chapters=scope_chapters,
+        from_page=from_page,
+        to_page=to_page,
+    )
+
+    # Print active scope summary
+    if valid_ids is not None:
+        scope_parts = []
+        if scope_source:
+            scope_parts.append(f"source='{scope_source}'")
+        if scope_chapters is not None:
+            scope_parts.append(f"chapters={scope_chapters}")
+        if scope_pages:
+            scope_parts.append(f"pages={scope_pages[0]}-{scope_pages[1]}")
+        strategy = getattr(args, "scope_strategy", "post")
+        console.print(
+            f"[bold green]Scope active[/bold green]: {', '.join(scope_parts)} "
+            f"| {len(valid_ids)} eligible chunks | strategy={strategy}"
+        )
+    else:
+        console.print("[dim]No scope filter active – searching all chunks.[/dim]")
+
     chat_history = []
     additional_log_info = {}
     print("Initialization complete. You can start asking questions!")
     print("Type 'exit' or 'quit' to end the session.")
+    print("Type 'history' to review your past queries and their sources.")
+
     while True:
-        print("CHAT HISTORY:", chat_history)  # Debug print to trace chat history
         try:
             q = input("\nAsk > ").strip()
             if not q:
@@ -405,7 +505,12 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
             if q.lower() in {"exit", "quit"}:
                 print("Goodbye!")
                 break
-            
+
+            # ---- history command ----
+            if q.lower() == "history":
+                _print_history(prov_store, console)
+                continue
+
             effective_q = q
             if cfg.enable_history and chat_history:
                 try:
@@ -414,22 +519,45 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                     additional_log_info["contextualized_query"] = effective_q
                     additional_log_info["original_query"] = q
                     additional_log_info["chat_history"] = chat_history
-                    print(f"Contextualized Query: {effective_q}")  # Debug print to trace contextualization
+                    print(f"Contextualized Query: {effective_q}")
                 except Exception as e:
                     print(f"Warning: Failed to contextualize query: {e}. Using original query.")
                     effective_q = q
-            
-            # Use the single query function. get_answer also renders the streaming markdown and takes care of logging, so we need not do anything else here.
-            ans = get_answer(effective_q, cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info)
 
-            # Update Chat history (make it atomic for user + assistant turn)
+            ans = get_answer(
+                effective_q,
+                cfg,
+                args,
+                logger,
+                console,
+                artifacts=artifacts,
+                additional_log_info=additional_log_info,
+                valid_ids=valid_ids,
+            )
+
+            # ---- Provenance logging ----
             try:
-                user_turn      = {"role": "user", "content": q}
+                if ans and ans != ANSWER_NOT_FOUND:
+                    # Build lightweight chunk provenance for SQLite log
+                    prov_chunks = meta_store.get_metadata_for_chunks(
+                        list(range(len(meta)))[:cfg.top_k]  # placeholder; topk_idxs not returned here
+                    )
+                    prov_store.log_query(
+                        query=effective_q,
+                        retrieved_chunks=prov_chunks,
+                        answer=ans,
+                        config_state=cfg.get_config_state(),
+                    )
+            except Exception as e:
+                print(f"Warning: provenance logging failed: {e}")
+
+            # Update Chat history (atomic for user + assistant turn)
+            try:
+                user_turn = {"role": "user", "content": q}
                 assistant_turn = {"role": "assistant", "content": ans}
-                chat_history  += [user_turn, assistant_turn]
+                chat_history += [user_turn, assistant_turn]
             except Exception as e:
                 print(f"Warning: Failed to update chat history: {e}")
-                # We can continue without chat history, so we do not break the loop here.
 
             # Trim chat history to avoid exceeding context window
             if len(chat_history) > cfg.max_history_turns * 2:
@@ -443,6 +571,29 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
             import traceback
             traceback.print_exc()
             break
+
+    meta_store.close()
+    prov_store.close()
+
+
+def _print_history(prov_store: "ProvenanceStore", console: "Console") -> None:
+    """Display the last 10 queries with their retrieved sources."""
+    rows = prov_store.get_history(limit=10)
+    if not rows:
+        console.print("[dim]No query history yet.[/dim]")
+        return
+    console.print("\n[bold cyan]=== Query History (newest first) ===[/bold cyan]\n")
+    for row in rows:
+        console.print(f"[bold]#{row['id']}[/bold] [{row['timestamp']}]")
+        console.print(f"  Q: {row['query']}")
+        if row["retrieved_chunks"]:
+            src_lines = []
+            for c in row["retrieved_chunks"][:3]:
+                pages = c.get("page_numbers", [])
+                page_str = f"pp. {pages[0]}–{pages[-1]}" if pages else "?"
+                src_lines.append(f"    • {c.get('section_path', c.get('section','?'))} ({page_str})")
+            console.print("  Sources:\n" + "\n".join(src_lines))
+        console.print(f"  A: {row['answer']}\n")
 
 
 

@@ -1,0 +1,34 @@
+[project]
+name = "tokensmith"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[dependencies]
+python = "3.12.*"
+pip = "*"
+cmake = "*"
+ninja = "*"
+make = "*"
+pkg-config = "*"
+git = "*"
+swig = "*"
+faiss-cpu = "*"
+
+[pypi-dependencies]
+llama-cpp-python = "*"
+pyyaml = "*"
+tqdm = "*"
+nltk = "*"
+transformers = "*"
+sentence-transformers = "*"
+rank_bm25 = "*"
+langchain = "*"
+langchain-text-splitters = "*"
+google-genai = "*"
+pytest = "*"
+rich = "*"
+fastapi = "*"
+uvicorn = "*"
+pydantic = "*"
+docling = "*"
+markdown = "*"
