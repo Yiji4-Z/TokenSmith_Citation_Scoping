@@ -4,7 +4,7 @@ embedding_model_context_window: 4096
 top_k: 10
 num_candidates: 50
 ensemble_method: "rrf"
-ranker_weights: {"faiss":1,"bm25":0,"index_keywords":0}
+ranker_weights: {"faiss":0.6,"bm25":0.4,"index_keywords":0}
 rrf_k: 60
 max_gen_tokens: 400
 chunk_mode: "recursive_sections"
@@ -23,3 +23,4 @@ semantic_cache_enabled: false
 semantic_cache_bi_encoder_threshold: 0.90
 semantic_cache_cross_encoder_threshold: 0.99
 enable_topic_extraction: false
+trust_score_threshold: 0.30

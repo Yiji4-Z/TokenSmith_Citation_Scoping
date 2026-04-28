@@ -24,6 +24,7 @@ from src.retriever import (
     apply_pre_filter,
     apply_post_filter,
     format_citations,
+    compute_trust_score,
     BM25Retriever,
     FAISSRetriever,
     IndexKeywordRetriever,
@@ -33,7 +34,7 @@ from src.retriever import (
 from src.ranking.reranker import rerank
 from src.cache import get_cache
 from src.metadata_store import MetadataStore, ProvenanceStore
-from src.utils import parse_chapter_arg
+from src.utils import parse_chapter_arg, detect_scope_from_query
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
 
@@ -80,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help=(
             "restrict retrieval to one or more chapters. "
-            "Examples: --scope_chapter 18  "
+            "Examples: --scope_chapter 5  "
             "--scope_chapter 1 2 3  "
             "--scope_chapter 1-5"
         ),
@@ -198,6 +199,9 @@ def get_answer(
     is_test_mode: bool = False,
     additional_log_info: Optional[Dict[str, Any]] = None,
     valid_ids: Optional[set] = None,
+    retrieval_question: Optional[str] = None,
+    meta_store=None,
+    prov_store=None,
 ) -> Union[str, Tuple[str, List[Dict[str, Any]], Optional[str]]]:
     """
     Run a single query through the pipeline.
@@ -207,6 +211,11 @@ def get_answer(
     valid_ids : optional set of chunk IDs produced by MetadataStore.build_valid_ids().
                 When provided, scoped retrieval is applied according to
                 args.scope_strategy ('pre' or 'post').
+    retrieval_question : if provided, used for FAISS/BM25 retrieval instead of
+                         `question`. Useful when the original query contains scope
+                         cues (e.g. "chapters 18-21") that improve embedding
+                         alignment, while `question` is the cleaner form used for
+                         generation and reranking.
     """
     chunks = artifacts["chunks"]
     sources = artifacts["sources"]
@@ -247,11 +256,15 @@ def get_answer(
     elif cfg.use_indexed_chunks:
         ranked_chunks, topk_idxs = use_indexed_chunks(question, chunks, cfg, args)
     else:
-        retrieval_query = question
+        retrieval_query = retrieval_question if retrieval_question is not None else question
         if cfg.use_hyde:
-            retrieval_query = generate_hypothetical_document(question, cfg.gen_model, max_tokens=cfg.hyde_max_tokens)
+            retrieval_query = generate_hypothetical_document(retrieval_query, cfg.gen_model, max_tokens=cfg.hyde_max_tokens)
 
         pool_n = max(cfg.num_candidates, cfg.top_k + 10)
+        # When post-filtering by scope, widen the candidate pool so that
+        # in-scope chunks are not crowded out by out-of-scope results.
+        if valid_ids is not None and scope_strategy == "post":
+            pool_n = max(pool_n, len(valid_ids))
         raw_scores: Dict[str, Dict[int, float]] = {}
         for retriever in retrievers:
             raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
@@ -349,6 +362,33 @@ def get_answer(
                 console.print("\n[bold yellow]Sources:[/bold yellow]")
                 console.print(citation_text)
 
+        # ---- Trust score display ----
+        try:
+            faiss_retriever = next(
+                (r for r in artifacts.get("retrievers", []) if isinstance(r, FAISSRetriever)),
+                None,
+            )
+            if faiss_retriever and topk_idxs and console:
+                trust, low_conf = compute_trust_score(
+                    topk_idxs,
+                    chunks,
+                    faiss_retriever.embedder,
+                    faiss_index=faiss_retriever.index,  # use stored vectors, no re-encoding
+                    low_confidence_threshold=cfg.trust_score_threshold,
+                )
+                if low_conf:
+                    console.print(
+                        f"\n[bold red]⚠ Low confidence[/bold red] "
+                        f"(chunk agreement: {trust:.2f}). "
+                        "Retrieved sources cover different topics — verify this answer in the source material."
+                    )
+                else:
+                    console.print(
+                        f"\n[dim]Confidence: {trust:.2f} (chunk agreement)[/dim]"
+                    )
+        except Exception:
+            pass  # trust score is best-effort; never block the answer
+
         # Logging (JSON file)
         page_nums = get_page_numbers(topk_idxs, meta)
         logger.save_chat_log(
@@ -384,9 +424,22 @@ def get_answer(
         cache_payload
     )
 
+    # Provenance logging — only when stores are supplied by the caller
+    if meta_store is not None and prov_store is not None and topk_idxs:
+        try:
+            prov_chunks = meta_store.get_metadata_for_chunks(topk_idxs)
+            prov_store.log_query(
+                query=question,
+                retrieved_chunks=prov_chunks,
+                answer=ans,
+                config_state=cfg.get_config_state(),
+            )
+        except Exception:
+            pass
+
     if is_test_mode:
         return ans, chunks_info, hyde_query
-    
+
     return ans
 
 def render_streaming_ans(console, stream_iter):
@@ -496,6 +549,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
     print("Initialization complete. You can start asking questions!")
     print("Type 'exit' or 'quit' to end the session.")
     print("Type 'history' to review your past queries and their sources.")
+    print("Tip: mention 'chapter 5', 'first half of the book', or 'pages 100-200' in your question to auto-scope retrieval.")
 
     while True:
         try:
@@ -524,6 +578,62 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                     print(f"Warning: Failed to contextualize query: {e}. Using original query.")
                     effective_q = q
 
+            # ---- Auto-scope detection (125% goal) ----
+            # Parse the raw user query for explicit chapter/page mentions and
+            # build a per-query valid_ids that narrows the session scope.
+            query_valid_ids = valid_ids  # default: use session-level scope
+            scope_applied = False        # tracks whether per-query scope was set
+            try:
+                detected = detect_scope_from_query(q, max_chapter=meta_store.get_max_chapter())
+                det_chapters = detected.get("chapters")
+                det_pages    = detected.get("pages")
+                if det_chapters or det_pages:
+                    det_from   = det_pages[0] if det_pages else None
+                    det_to     = det_pages[1] if det_pages else None
+                    auto_ids   = meta_store.build_valid_ids(
+                        chapters=det_chapters,
+                        from_page=det_from,
+                        to_page=det_to,
+                    )
+                    if auto_ids is not None:
+                        # Intersect with any session scope already active
+                        candidate = (
+                            auto_ids if valid_ids is None else valid_ids & auto_ids
+                        )
+                        scope_desc = []
+                        if det_chapters:
+                            scope_desc.append(f"chapters={det_chapters}")
+                        if det_pages:
+                            scope_desc.append(f"pages={det_pages[0]}-{det_pages[1]}")
+                        if candidate:
+                            query_valid_ids = candidate
+                            scope_applied = True
+                            console.print(
+                                f"[bold green]Auto-scope detected[/bold green]: "
+                                f"{', '.join(scope_desc)} "
+                                f"| {len(query_valid_ids)} eligible chunks"
+                            )
+                            additional_log_info["auto_scope"] = detected
+                        else:
+                            # Intersection is empty — the detected scope has no
+                            # indexed chunks (e.g. a chapter number not in the
+                            # textbook).  Fall back to the session scope so the
+                            # query still gets an answer.
+                            console.print(
+                                f"[yellow]Auto-scope detected ({', '.join(scope_desc)}) "
+                                f"but no indexed chunks match — falling back to session scope.[/yellow]"
+                            )
+            except Exception as e:
+                print(f"Warning: auto-scope detection failed: {e}")
+
+            # When the user's query contains an explicit scope cue (e.g.
+            # "chapters 18-21"), use the original query for FAISS retrieval.
+            # Contextualization strips those cue words, producing a shorter
+            # query whose embedding aligns poorly with the scoped chapters.
+            # For unscoped follow-ups, use the contextualized query so that
+            # pronoun/reference resolution still helps retrieval.
+            retrieval_q = q if scope_applied else effective_q
+
             ans = get_answer(
                 effective_q,
                 cfg,
@@ -532,24 +642,27 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                 console,
                 artifacts=artifacts,
                 additional_log_info=additional_log_info,
-                valid_ids=valid_ids,
+                valid_ids=query_valid_ids,
+                retrieval_question=retrieval_q,
+                meta_store=meta_store,
+                prov_store=prov_store,
             )
 
-            # ---- Provenance logging ----
-            try:
-                if ans and ans != ANSWER_NOT_FOUND:
-                    # Build lightweight chunk provenance for SQLite log
-                    prov_chunks = meta_store.get_metadata_for_chunks(
-                        list(range(len(meta)))[:cfg.top_k]  # placeholder; topk_idxs not returned here
+            # When scope is active and nothing was found, give a targeted hint
+            # depending on whether the scope came from auto-detection or CLI flags.
+            if ans == ANSWER_NOT_FOUND and query_valid_ids is not None:
+                if scope_applied:
+                    console.print(
+                        "\n[yellow]Tip: no chunks matched the chapter/page scope "
+                        "detected in your question. Try rephrasing without mentioning "
+                        "a specific chapter or page number to search the full document.[/yellow]"
                     )
-                    prov_store.log_query(
-                        query=effective_q,
-                        retrieved_chunks=prov_chunks,
-                        answer=ans,
-                        config_state=cfg.get_config_state(),
+                else:
+                    console.print(
+                        "\n[yellow]Tip: no chunks matched within the active scope. "
+                        "Try asking without a scope filter (omit --scope_chapter / "
+                        "--scope_pages / --scope_source) to search the full document.[/yellow]"
                     )
-            except Exception as e:
-                print(f"Warning: provenance logging failed: {e}")
 
             # Update Chat history (atomic for user + assistant turn)
             try:

@@ -69,7 +69,6 @@ def build_index(
 
     page_to_chunk_ids = {}
     current_page = 1
-    total_chunks = 0
     heading_stack = []
 
     # Step 1: Chunk
@@ -90,27 +89,31 @@ def build_index(
         sub_chunks = chunker.chunk(c['content'])
         page_pattern = re.compile(r'--- Page (\d+) ---')
 
+        is_intro = c["heading"] == "Introduction"
+
         for sub_chunk_id, sub_chunk in enumerate(sub_chunks):
             chunk_pages = set()
             fragments = page_pattern.split(sub_chunk)
 
-            if fragments[0].strip():
-                page_to_chunk_ids.setdefault(current_page, set()).add(total_chunks + sub_chunk_id)
+            if fragments[0].strip() and not is_intro:
+                page_to_chunk_ids.setdefault(current_page, set()).add(len(all_chunks))
                 chunk_pages.add(current_page)
 
-            for idx in range(1, len(fragments), 2):
+            for i in range(1, len(fragments), 2):
                 try:
-                    new_page = int(fragments[idx]) + 1
-                    if fragments[idx + 1].strip():
-                        page_to_chunk_ids.setdefault(new_page, set()).add(total_chunks + sub_chunk_id)
+                    new_page = int(fragments[i]) + 1
+
+                    if fragments[i+1].strip() and not is_intro:
+                        page_to_chunk_ids.setdefault(new_page, set()).add(len(all_chunks))
                         chunk_pages.add(new_page)
+
                     current_page = new_page
                 except (IndexError, ValueError):
                     continue
 
             clean_chunk = re.sub(page_pattern, '', sub_chunk).strip()
 
-            if c["heading"] == "Introduction":
+            if is_intro:
                 continue
 
             meta = {
@@ -122,7 +125,7 @@ def build_index(
                 "section_path": full_section_path,
                 "text_preview": clean_chunk[:100],
                 "page_numbers": sorted(list(chunk_pages)),
-                "chunk_id": total_chunks + sub_chunk_id,
+                "chunk_id": len(all_chunks)
             }
 
             chunk_prefix = (
@@ -134,10 +137,8 @@ def build_index(
             sources.append(markdown_file)
             metadata.append(meta)
 
-        total_chunks += len(sub_chunks)
-
-    # Save page-to-chunk map
     final_map = {page: sorted(list(ids)) for page, ids in page_to_chunk_ids.items()}
+
     output_file = artifacts_dir / f"{index_prefix}_page_to_chunk_map.json"
     with open(output_file, "w") as f:
         json.dump(final_map, f, indent=2)

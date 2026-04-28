@@ -110,6 +110,76 @@ def apply_post_filter(ordered: List[int], valid_ids: Optional[set]) -> List[int]
     return [i for i in ordered if i in valid_ids]
 
 
+def compute_trust_score(
+    topk_idxs: List[int],
+    chunks: List[str],
+    embedder,
+    low_confidence_threshold: float = 0.30,
+    faiss_index=None,
+) -> Tuple[float, bool]:
+    """Compute a trust score for a set of retrieved chunks.
+
+    The score is the mean pairwise cosine similarity among the top-k chunk
+    embeddings.  High agreement (high score) means the retrieved chunks are
+    topically coherent and the answer is likely well-supported.  Low
+    agreement flags that the retriever pulled from scattered topics, so the
+    student should verify the answer in the textbook.
+
+    Parameters
+    ----------
+    topk_idxs : list of chunk indices (as returned by filter_retrieved_chunks)
+    chunks    : full chunk text list
+    embedder  : a CachedEmbedder (or any object with .encode(texts) -> ndarray)
+    low_confidence_threshold : mean similarity below this → low confidence
+    faiss_index : optional FAISS index; when provided, pre-stored embeddings
+                  are retrieved via index.reconstruct() instead of re-encoding
+                  the chunk texts.  This is faster and more consistent since
+                  these are the exact same vectors used for retrieval.
+
+    Returns
+    -------
+    (mean_pairwise_similarity, is_low_confidence)
+    """
+    if len(topk_idxs) < 2:
+        # With fewer than 2 chunks there is nothing to compare; trust fully.
+        return 1.0, False
+
+    valid_idxs = [i for i in topk_idxs if 0 <= i < len(chunks)]
+    if len(valid_idxs) < 2:
+        return 1.0, False
+
+    if faiss_index is not None:
+        # Preferred path: retrieve pre-computed embeddings from the FAISS index.
+        # reconstruct(i) returns the exact vector stored at position i, which is
+        # the same vector that drove retrieval — no model inference needed.
+        try:
+            vecs = np.array(
+                [faiss_index.reconstruct(i) for i in valid_idxs],
+                dtype="float32",
+            )
+        except Exception:
+            # Fall back to re-encoding if reconstruct fails (e.g. IVF index
+            # after a reconstruct_n call without an explicit mapping).
+            texts = [chunks[i] for i in valid_idxs]
+            vecs = embedder.encode(texts).astype("float32")
+    else:
+        texts = [chunks[i] for i in valid_idxs]
+        vecs = embedder.encode(texts).astype("float32")
+
+    # L2-normalise so dot product == cosine similarity
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    vecs = vecs / norms
+
+    # Compute upper-triangle pairwise similarities
+    sim_matrix = vecs @ vecs.T
+    n = len(vecs)
+    pairs = [(sim_matrix[i, j]) for i in range(n) for j in range(i + 1, n)]
+    mean_sim = float(np.mean(pairs)) if pairs else 1.0
+
+    return mean_sim, mean_sim < low_confidence_threshold
+
+
 def format_citations(topk_idxs: List[int], meta: List[dict]) -> str:
     """
     Build a human-readable citation block for the top retrieved chunks.

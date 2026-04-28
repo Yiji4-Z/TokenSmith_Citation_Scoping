@@ -26,8 +26,18 @@ from typing import Dict, List, Optional, Set
 # ---------------------------------------------------------------------------
 
 def _extract_chapter(section_path: str) -> Optional[int]:
-    """Extract chapter number from section_path like 'Chapter 18 Section 18.1 …'."""
-    m = re.match(r"Chapter\s+(\d+)", section_path or "", re.IGNORECASE)
+    """Extract a chapter/unit/part/module number from a section_path string.
+
+    Handles common structural prefixes used across different books:
+      "Chapter 18 …"   "Unit 3 …"   "Part 2 …"
+      "Module 5 …"     "Ch. 14 …"   "Lecture 7 …"
+    Returns the integer that follows the prefix, or None if none is found.
+    """
+    m = re.match(
+        r"(?:Chapter|Unit|Part|Module|Lecture|Ch\.?|Lesson)\s+(\d+)",
+        section_path or "",
+        re.IGNORECASE,
+    )
     return int(m.group(1)) if m else None
 
 
@@ -131,6 +141,17 @@ class MetadataStore:
         """Return the set of every indexed chunk ID."""
         cur = self._con.execute("SELECT chunk_id FROM chunk_metadata")
         return {row[0] for row in cur.fetchall()}
+
+    def get_max_chapter(self) -> Optional[int]:
+        """Return the highest chapter number present in the metadata store.
+
+        Returns None when the store is empty or no chapter numbers were parsed.
+        """
+        cur = self._con.execute(
+            "SELECT MAX(chapter) FROM chunk_metadata WHERE chapter IS NOT NULL"
+        )
+        row = cur.fetchone()
+        return row[0] if row and row[0] is not None else None
 
     def get_chunk_ids_by_source(self, source: str) -> Set[int]:
         """
